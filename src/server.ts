@@ -5,6 +5,22 @@ import { WebSocketServer } from "ws";
 import webhookRouter from "./routes/webhook.js";
 import { handleCallWebSocket } from "./ws/callHandler.js";
 
+const REQUIRED_ENV = [
+  "BASE_URL",
+  "TWILIO_ACCOUNT_SID",
+  "TWILIO_AUTH_TOKEN",
+  "DEEPGRAM_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "ELEVENLABS_API_KEY",
+  "ELEVENLABS_VOICE_ID",
+];
+
+const missing = REQUIRED_ENV.filter((key) => !process.env[key]);
+if (missing.length > 0) {
+  console.error(`[Server] Variáveis de ambiente em falta: ${missing.join(", ")}`);
+  process.exit(1);
+}
+
 const PORT = process.env.PORT ?? 3000;
 
 const app = express();

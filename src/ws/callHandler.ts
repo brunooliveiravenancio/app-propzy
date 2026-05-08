@@ -4,19 +4,95 @@ import { createDeepgramStream, sendAudioToDeepgram } from "../services/deepgram.
 import { getAgentReply, extractLeadFromHistory } from "../services/deepseek.js";
 import { synthesizeSpeech, audioBufferToBase64Chunks } from "../services/elevenlabs.js";
 import { buildContextSummary, mergeLeadData, isLeadQualified } from "../agent/qualification.js";
-import { CLOSING_PROMPT } from "../agent/prompts.js";
 import { createLead } from "../crm/client.js";
+
+const INACTIVITY_WARNING_MS = 30_000;
+const INACTIVITY_HANGUP_MS = 60_000;
 
 export function handleCallWebSocket(ws: WebSocket): void {
   let state: CallState | null = null;
   let transcriptBuffer = "";
   let isProcessing = false;
+  let ttsController: AbortController | null = null;
+  let silenceWarningTimer: NodeJS.Timeout | null = null;
+  let silenceHangupTimer: NodeJS.Timeout | null = null;
+
+  function resetInactivityTimers(): void {
+    if (silenceWarningTimer) clearTimeout(silenceWarningTimer);
+    if (silenceHangupTimer) clearTimeout(silenceHangupTimer);
+
+    silenceWarningTimer = setTimeout(async () => {
+      if (!state || isProcessing) return;
+      const warning = "Continua por aí? Estou aqui se precisar de alguma informação.";
+      isProcessing = true;
+      ttsController = new AbortController();
+      await sendBotReply(warning, ttsController.signal);
+      ttsController = null;
+      isProcessing = false;
+    }, INACTIVITY_WARNING_MS);
+
+    silenceHangupTimer = setTimeout(() => {
+      console.log("[Timeout] Chamada encerrada por inatividade");
+      ws.close();
+    }, INACTIVITY_HANGUP_MS);
+  }
+
+  function clearInactivityTimers(): void {
+    if (silenceWarningTimer) clearTimeout(silenceWarningTimer);
+    if (silenceHangupTimer) clearTimeout(silenceHangupTimer);
+    silenceWarningTimer = null;
+    silenceHangupTimer = null;
+  }
+
+  async function saveLead(): Promise<void> {
+    if (!state || state.leadSaved || Object.keys(state.lead).length === 0) return;
+    state.leadSaved = true;
+    console.log(`[Call ${state.callSid}] A guardar lead no CRM...`);
+    await createLead(state.lead, state.callerPhone, transcriptBuffer);
+  }
+
+  async function sendBotReply(text: string, signal: AbortSignal): Promise<void> {
+    if (!state) return;
+    state.isBotSpeaking = true;
+    try {
+      const audioBuffer = await synthesizeSpeech(text);
+      if (signal.aborted) return;
+
+      const chunks = audioBufferToBase64Chunks(audioBuffer);
+      ws.send(JSON.stringify({ event: "clear", streamSid: state.streamSid }));
+
+      for (const chunk of chunks) {
+        if (signal.aborted) break;
+        ws.send(
+          JSON.stringify({
+            event: "media",
+            streamSid: state.streamSid,
+            media: { payload: chunk },
+          })
+        );
+      }
+    } catch (err) {
+      if (!signal.aborted) console.error("[TTS] Erro ao sintetizar voz:", err);
+    } finally {
+      state.isBotSpeaking = false;
+    }
+  }
 
   const deepgramConn = createDeepgramStream(async (transcript: string) => {
-    if (!state || isProcessing || state.isBotSpeaking) return;
-    if (!transcript.trim()) return;
+    if (!state || !transcript.trim()) return;
+
+    // Barge-in: cliente fala enquanto bot está a falar
+    if (state.isBotSpeaking && ttsController) {
+      ttsController.abort();
+      state.isBotSpeaking = false;
+      isProcessing = false;
+      ws.send(JSON.stringify({ event: "clear", streamSid: state.streamSid }));
+    }
+
+    if (isProcessing) return;
 
     isProcessing = true;
+    resetInactivityTimers();
     console.log(`[Call ${state.callSid}] Cliente: ${transcript}`);
 
     state.history.push({ role: "user", content: transcript });
@@ -24,8 +100,6 @@ export function handleCallWebSocket(ws: WebSocket): void {
 
     try {
       const contextSummary = buildContextSummary(state);
-
-      // Se lead está qualificado, usar prompt de fecho
       const qualifiedClosing =
         isLeadQualified(state.lead) && state.stage !== "closing"
           ? `\n\n[O lead está qualificado. Faz o encerramento da chamada.]`
@@ -35,19 +109,24 @@ export function handleCallWebSocket(ws: WebSocket): void {
 
       state.history.push({ role: "assistant", content: reply });
       transcriptBuffer += `Agente: ${reply}\n`;
-
       console.log(`[Call ${state.callSid}] Agente: ${reply}`);
 
-      // Extrair dados do lead em background
-      extractLeadFromHistory(state.history).then((extracted) => {
-        if (state) {
-          state.lead = mergeLeadData(state.lead, extracted);
-        }
-      });
+      // Aguardar extração para evitar race condition
+      const extracted = await extractLeadFromHistory(state.history);
+      state.lead = mergeLeadData(state.lead, extracted);
 
-      // Sintetizar e enviar áudio
-      await sendBotReply(ws, state.streamSid, reply);
-      state.stage = isLeadQualified(state.lead) ? "closing" : state.stage;
+      if (isLeadQualified(state.lead)) {
+        state.stage = "closing";
+      }
+
+      ttsController = new AbortController();
+      await sendBotReply(reply, ttsController.signal);
+      ttsController = null;
+
+      // Se chegou ao fecho, guardar lead e encerrar chamada
+      if (state.stage === "closing" && !state.leadSaved) {
+        await saveLead();
+      }
     } catch (err) {
       console.error(`[Call ${state.callSid}] Erro no pipeline:`, err);
     } finally {
@@ -56,7 +135,12 @@ export function handleCallWebSocket(ws: WebSocket): void {
   });
 
   ws.on("message", async (data: WebSocket.Data) => {
-    const msg = JSON.parse(data.toString()) as TwilioMediaMessage;
+    let msg: TwilioMediaMessage;
+    try {
+      msg = JSON.parse(data.toString()) as TwilioMediaMessage;
+    } catch {
+      return;
+    }
 
     switch (msg.event) {
       case "start": {
@@ -70,14 +154,18 @@ export function handleCallWebSocket(ws: WebSocket): void {
           lead: {},
           history: [],
           isBotSpeaking: false,
+          leadSaved: false,
         };
-        console.log(`[Call ${callSid}] Chamada iniciada`);
+        console.log(`[Call ${callSid}] Chamada iniciada de ${state.callerPhone}`);
+        resetInactivityTimers();
 
-        // Saudação inicial
-        const greeting = "Olá, obrigado por contactar a Propzy! Sou a assistente virtual. Em que posso ajudá-lo hoje?";
+        const greeting =
+          "Olá, obrigado por contactar a Propzy! Sou a assistente virtual. Em que posso ajudá-lo hoje?";
         state.history.push({ role: "assistant", content: greeting });
         transcriptBuffer += `Agente: ${greeting}\n`;
-        await sendBotReply(ws, streamSid, greeting);
+        ttsController = new AbortController();
+        await sendBotReply(greeting, ttsController.signal);
+        ttsController = null;
         break;
       }
 
@@ -89,47 +177,23 @@ export function handleCallWebSocket(ws: WebSocket): void {
       }
 
       case "stop": {
-        if (state) {
-          console.log(`[Call ${state.callSid}] Chamada terminada. A guardar lead...`);
-          deepgramConn.finish();
-          await createLead(state.lead, state.callerPhone, transcriptBuffer);
-        }
+        clearInactivityTimers();
+        deepgramConn.finish();
+        await saveLead();
         break;
       }
     }
   });
 
   ws.on("close", async () => {
+    clearInactivityTimers();
     deepgramConn.finish();
-    if (state?.lead && Object.keys(state.lead).length > 0) {
-      await createLead(state.lead, state.callerPhone, transcriptBuffer);
-    }
+    await saveLead();
   });
 
   ws.on("error", (err) => {
     console.error("[WebSocket] Erro:", err);
+    clearInactivityTimers();
     deepgramConn.finish();
   });
-}
-
-async function sendBotReply(ws: WebSocket, streamSid: string, text: string): Promise<void> {
-  try {
-    const audioBuffer = await synthesizeSpeech(text);
-    const chunks = audioBufferToBase64Chunks(audioBuffer);
-
-    // Limpar buffer de áudio anterior do Twilio
-    ws.send(JSON.stringify({ event: "clear", streamSid }));
-
-    for (const chunk of chunks) {
-      ws.send(
-        JSON.stringify({
-          event: "media",
-          streamSid,
-          media: { payload: chunk },
-        })
-      );
-    }
-  } catch (err) {
-    console.error("[TTS] Erro ao sintetizar voz:", err);
-  }
 }

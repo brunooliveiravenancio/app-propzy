@@ -36,5 +36,5 @@ export function createDeepgramStream(onTranscript: TranscriptCallback): ListenLi
 
 export function sendAudioToDeepgram(connection: ListenLiveClient, payload: string): void {
   const buffer = Buffer.from(payload, "base64");
-  connection.send(buffer);
+  connection.send(buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength) as ArrayBuffer);
 }

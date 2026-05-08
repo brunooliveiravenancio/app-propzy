@@ -33,6 +33,7 @@ export interface CallState {
   lead: LeadData;
   history: ConversationMessage[];
   isBotSpeaking: boolean;
+  leadSaved: boolean;
 }
 
 export interface TwilioMediaMessage {

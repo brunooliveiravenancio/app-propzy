@@ -38,7 +38,8 @@ export async function extractLeadFromHistory(history: ConversationMessage[]): Pr
   const response = await client.chat.completions.create({
     model: "deepseek-chat",
     messages: [
-      { role: "user", content: EXTRACT_LEAD_PROMPT(transcript) },
+      { role: "system", content: EXTRACT_LEAD_PROMPT(transcript) },
+      { role: "user", content: "Extrai o lead da conversa acima em JSON." },
     ],
     max_tokens: 300,
     temperature: 0,
