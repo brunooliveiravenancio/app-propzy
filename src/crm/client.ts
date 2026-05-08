@@ -16,7 +16,7 @@ export interface CrmLead {
   transcricao?: string;
 }
 
-export async function createLead(lead: LeadData, telefone: string, transcricao?: string): Promise<string | null> {
+export async function createLead(lead: LeadData, telefone: string, transcricao?: string, fonte: "chamada_inbound" | "chamada_outbound" = "chamada_inbound"): Promise<string | null> {
   const crmUrl = process.env.CRM_API_URL;
   const crmKey = process.env.CRM_API_KEY;
 
@@ -36,7 +36,7 @@ export async function createLead(lead: LeadData, telefone: string, transcricao?:
     orcamento: lead.orcamento,
     prazo: lead.prazo,
     observacoes: lead.observacoes,
-    fonte: "chamada_inbound",
+    fonte,
     dataContacto: new Date().toISOString(),
     transcricao,
   };

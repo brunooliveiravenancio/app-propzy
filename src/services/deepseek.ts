@@ -10,9 +10,10 @@ const client = new OpenAI({
 
 export async function getAgentReply(
   history: ConversationMessage[],
-  contextSummary: string
+  contextSummary: string,
+  systemPromptOverride?: string
 ): Promise<string> {
-  const systemWithContext = SYSTEM_PROMPT + contextSummary;
+  const systemWithContext = (systemPromptOverride ?? SYSTEM_PROMPT) + contextSummary;
 
   const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
     { role: "system", content: systemWithContext },

@@ -15,15 +15,23 @@ export function isLeadQualified(lead: LeadData): boolean {
 }
 
 export function buildContextSummary(state: CallState): string {
-  const { lead } = state;
+  const { lead, listingData } = state;
   const parts: string[] = [];
+
+  if (listingData) {
+    const listing = [listingData.tipologia, listingData.morada, listingData.preco]
+      .filter(Boolean)
+      .join(" | ");
+    if (listing) parts.push(`Imóvel em apresentação: ${listing}`);
+  }
+
   if (lead.nome) parts.push(`Nome: ${lead.nome}`);
   if (lead.intencao) parts.push(`Intenção: ${lead.intencao}`);
   if (lead.tipoImovel) parts.push(`Tipo de imóvel: ${lead.tipoImovel}`);
   if (lead.zona) parts.push(`Zona: ${lead.zona}`);
   if (lead.orcamento) parts.push(`Orçamento: ${lead.orcamento}`);
   if (lead.prazo) parts.push(`Prazo: ${lead.prazo}`);
-  return parts.length > 0 ? `\n\n[Informação já recolhida: ${parts.join(" | ")}]` : "";
+  return parts.length > 0 ? `\n\n[Contexto: ${parts.join(" | ")}]` : "";
 }
 
 export function mergeLeadData(existing: LeadData, extracted: Partial<LeadData>): LeadData {

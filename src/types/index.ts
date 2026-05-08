@@ -3,6 +3,13 @@ export interface ConversationMessage {
   content: string;
 }
 
+export interface ListingData {
+  morada?: string;
+  preco?: string;
+  tipologia?: string;
+  descricao?: string;
+}
+
 export interface LeadData {
   nome?: string;
   telefone?: string;
@@ -29,6 +36,8 @@ export interface CallState {
   callSid: string;
   streamSid: string;
   callerPhone: string;
+  callDirection: "inbound" | "outbound";
+  listingData?: ListingData;
   stage: QualificationStage;
   lead: LeadData;
   history: ConversationMessage[];

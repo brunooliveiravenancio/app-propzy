@@ -1,13 +1,22 @@
 import WebSocket from "ws";
-import { CallState, TwilioMediaMessage } from "../types/index.js";
+import { CallState, ListingData, TwilioMediaMessage } from "../types/index.js";
 import { createDeepgramStream, sendAudioToDeepgram } from "../services/deepgram.js";
 import { getAgentReply, extractLeadFromHistory } from "../services/deepseek.js";
 import { synthesizeSpeech, audioBufferToBase64Chunks } from "../services/elevenlabs.js";
 import { buildContextSummary, mergeLeadData, isLeadQualified } from "../agent/qualification.js";
+import { OUTBOUND_SYSTEM_PROMPT } from "../agent/prompts.js";
 import { createLead } from "../crm/client.js";
 
 const INACTIVITY_WARNING_MS = 30_000;
 const INACTIVITY_HANGUP_MS = 60_000;
+
+function buildOutboundGreeting(listing?: ListingData): string {
+  if (!listing?.morada && !listing?.tipologia) {
+    return "Bom dia! Fala com a assistente da Propzy. Estou a ligar sobre um imóvel disponível que pode ser do seu interesse. Tem um momento?";
+  }
+  const desc = [listing.tipologia, listing.morada, listing.preco].filter(Boolean).join(", ");
+  return `Bom dia! Fala com a assistente da Propzy. Estou a ligar sobre ${desc}. Tem um momento para lhe dar mais informações?`;
+}
 
 export function handleCallWebSocket(ws: WebSocket): void {
   let state: CallState | null = null;
@@ -47,8 +56,9 @@ export function handleCallWebSocket(ws: WebSocket): void {
   async function saveLead(): Promise<void> {
     if (!state || state.leadSaved || Object.keys(state.lead).length === 0) return;
     state.leadSaved = true;
-    console.log(`[Call ${state.callSid}] A guardar lead no CRM...`);
-    await createLead(state.lead, state.callerPhone, transcriptBuffer);
+    console.log(`[Call ${state.callSid}] A guardar lead no CRM (${state.callDirection})...`);
+    const fonte = state.callDirection === "outbound" ? "chamada_outbound" : "chamada_inbound";
+    await createLead(state.lead, state.callerPhone, transcriptBuffer, fonte);
   }
 
   async function sendBotReply(text: string, signal: AbortSignal): Promise<void> {
@@ -78,6 +88,12 @@ export function handleCallWebSocket(ws: WebSocket): void {
     }
   }
 
+  function getSystemPrompt(): string {
+    if (!state || state.callDirection === "inbound") return "";
+    const l = state.listingData;
+    return OUTBOUND_SYSTEM_PROMPT(l?.morada, l?.tipologia, l?.preco, l?.descricao);
+  }
+
   const deepgramConn = createDeepgramStream(async (transcript: string) => {
     if (!state || !transcript.trim()) return;
 
@@ -105,7 +121,12 @@ export function handleCallWebSocket(ws: WebSocket): void {
           ? `\n\n[O lead está qualificado. Faz o encerramento da chamada.]`
           : "";
 
-      const reply = await getAgentReply(state.history, contextSummary + qualifiedClosing);
+      const outboundSystemOverride = getSystemPrompt();
+      const reply = await getAgentReply(
+        state.history,
+        contextSummary + qualifiedClosing,
+        outboundSystemOverride || undefined
+      );
 
       state.history.push({ role: "assistant", content: reply });
       transcriptBuffer += `Agente: ${reply}\n`;
@@ -146,21 +167,33 @@ export function handleCallWebSocket(ws: WebSocket): void {
       case "start": {
         const callSid = msg.start?.callSid ?? "unknown";
         const streamSid = msg.start?.streamSid ?? "";
+        const params = msg.start?.customParameters ?? {};
+        const direction = params["direction"] === "outbound" ? "outbound" : "inbound";
+
+        let listingData: ListingData | undefined;
+        if (params["listing"]) {
+          try { listingData = JSON.parse(params["listing"]) as ListingData; } catch { /* ignorar */ }
+        }
+
         state = {
           callSid,
           streamSid,
-          callerPhone: msg.start?.customParameters?.["From"] ?? "unknown",
+          callerPhone: params["From"] ?? "unknown",
+          callDirection: direction,
+          listingData,
           stage: "greeting",
           lead: {},
           history: [],
           isBotSpeaking: false,
           leadSaved: false,
         };
-        console.log(`[Call ${callSid}] Chamada iniciada de ${state.callerPhone}`);
+        console.log(`[Call ${callSid}] Chamada ${direction} de/para ${state.callerPhone}`);
         resetInactivityTimers();
 
-        const greeting =
-          "Olá, obrigado por contactar a Propzy! Sou a assistente virtual. Em que posso ajudá-lo hoje?";
+        const greeting = direction === "outbound"
+          ? buildOutboundGreeting(listingData)
+          : "Olá, obrigado por contactar a Propzy! Sou a assistente virtual. Em que posso ajudá-lo hoje?";
+
         state.history.push({ role: "assistant", content: greeting });
         transcriptBuffer += `Agente: ${greeting}\n`;
         ttsController = new AbortController();
